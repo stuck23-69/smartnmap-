@@ -1,144 +1,197 @@
-"""Build nmap commands for one target.
+"""Scan one target with nmap.
 
-Example:
+Examples:
     python3 nmap_scans.py 192.168.1.10
-    python3 nmap_scans.py scanme.nmap.org --ai
+    python3 nmap_scans.py 192.168.1.10 --quick
+    python3 nmap_scans.py 192.168.1.10 --windows
+    python3 nmap_scans.py 192.168.1.10 --ai --model qwen2.5:1.5b
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+import shutil
+import subprocess
+import sys
 
-ScanType = Literal["quick", "full", "version", "udp", "stealth"]
+FAST_FLAGS = ("-Pn", "-sS", "-T4", "-F")
+WINDOWS_FLAGS = (
+    "-Pn",
+    "-sS",
+    "-sV",
+    "-T4",
+    "--source-port",
+    "53",
+    "-p",
+    "21,53,80,135,3389",
+)
+OTHER_FLAGS = ("-Pn", "-sS", "-sV", "-T4", "--top-ports", "100")
 
-
-@dataclass
-class ScanProfile:
-    """One scan shape. The target is filled in later."""
-
-    name: str
-    scan_type: ScanType | None = None
-    ports: str | None = None  # e.g. "22,80,443" or "1-1000"
-    extra_args: str = ""
-    # Exact nmap flags, in order. Used by the Windows profiles.
-    flags: tuple[str, ...] | None = None
-
-
-@dataclass
-class NmapScan:
-    name: str
-    target: str
-    scan_type: ScanType | None = None
-    ports: str | None = None
-    extra_args: str = ""
-    flags: tuple[str, ...] | None = None
-
-    def command(self) -> list[str]:
-        """Build an nmap argv list (without shell)."""
-        if self.flags:
-            return ["nmap", *self.flags, self.target]
-
-        cmd = ["nmap"]
-        if self.scan_type == "quick":
-            cmd.append("-F")
-        elif self.scan_type == "full":
-            cmd.extend(["-p-"])
-        elif self.scan_type == "version":
-            cmd.append("-sV")
-        elif self.scan_type == "udp":
-            cmd.append("-sU")
-        elif self.scan_type == "stealth":
-            cmd.extend(["-sS"])
-        if self.ports:
-            cmd.extend(["-p", self.ports])
-        if self.extra_args:
-            cmd.extend(self.extra_args.split())
-        cmd.append(self.target)
-        return cmd
+# Strings that showed up on the Windows lab hosts.
+WINDOWS_MARKERS = (
+    "135/tcp",
+    "3389/tcp",
+    "msrpc",
+    "ms-wbt-server",
+    "microsoft iis",
+)
 
 
-# Used for every target.
-COMMON_PROFILES: list[ScanProfile] = [
-    ScanProfile("quick", "quick"),
-    ScanProfile("common_ports", "version", ports="22,80,443,8080"),
-    ScanProfile("full_tcp", "full", extra_args="-T4"),
-    ScanProfile("stealth_syn", "stealth", ports="1-1024", extra_args="-Pn"),
-]
-
-# Indicators from testing: ports 135 or 3389, or services
-# msrpc, ms-wbt-server, Microsoft IIS. The user passes --windows
-# when they already know the host matches. This script does not run nmap.
-WINDOWS_PROFILES: list[ScanProfile] = [
-    ScanProfile(
-        "windows_ports",
-        flags=(
-            "-Pn",
-            "-sS",
-            "-sV",
-            "-T4",
-            "--source-port",
-            "53",
-            "-p",
-            "21,53,80,135,3389",
-        ),
-    ),
-    ScanProfile(
-        "windows_fast",
-        flags=("-Pn", "-sS", "-sV", "-T4", "-F"),
-    ),
-]
+def require_nmap() -> None:
+    """Stop immediately when the nmap binary is not available."""
+    if shutil.which("nmap") is None:
+        print("Error: nmap is not installed or not on PATH.", file=sys.stderr)
+        sys.exit(1)
 
 
-def extra_profiles(target: str, windows: bool = False) -> list[ScanProfile]:
-    """Windows commands. Returned only when --windows is set."""
-    if windows and target:
-        return list(WINDOWS_PROFILES)
-    return []
-
-
-def scans_for_target(target: str, windows: bool = False) -> list[NmapScan]:
-    """Commands for this IP or hostname.
-
-    --windows replaces the common list with WINDOWS_PROFILES.
-    """
-    if windows:
-        profiles = extra_profiles(target, windows=True)
-    else:
-        profiles = list(COMMON_PROFILES)
-    return [
-        NmapScan(
-            name=profile.name,
-            target=target,
-            scan_type=profile.scan_type,
-            ports=profile.ports,
-            extra_args=profile.extra_args,
-            flags=profile.flags,
+def run_nmap(target: str, flags: tuple[str, ...]) -> str:
+    """Run one nmap command, print its output as it arrives, and return the text."""
+    cmd = ["nmap", *flags, target]
+    print("$ " + " ".join(cmd), flush=True)
+    print(flush=True)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
-        for profile in profiles
-    ]
+    except OSError as exc:
+        print(f"Error: could not start nmap: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    lines: list[str] = []
+    if proc.stdout is None:
+        print("Error: could not read nmap output.", file=sys.stderr)
+        sys.exit(1)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+
+    code = proc.wait()
+    if code != 0:
+        print(f"Error: nmap exited with status {code}.", file=sys.stderr)
+        sys.exit(1)
+    return "".join(lines)
+
+
+def host_is_windows(output: str) -> bool:
+    """True when the fast scan text contains a Windows marker."""
+    lowered = output.lower()
+    return any(marker in lowered for marker in WINDOWS_MARKERS)
+
+
+def open_port_lines(output: str) -> list[str]:
+    """Open-port rows from nmap. A later row for the same port replaces an earlier one."""
+    order: list[str] = []
+    by_port: dict[str, str] = {}
+    for raw in output.splitlines():
+        parts = raw.split()
+        if len(parts) < 2 or parts[1] != "open":
+            continue
+        port = parts[0]
+        if "/tcp" not in port and "/udp" not in port:
+            continue
+        if port not in by_port:
+            order.append(port)
+        by_port[port] = raw.strip()
+    return [by_port[port] for port in order]
+
+
+def port_numbers(port_lines: list[str]) -> str:
+    """'80/tcp open http' lines become '80,443'."""
+    numbers: list[str] = []
+    for line in port_lines:
+        number = line.split()[0].split("/")[0]
+        if number not in numbers:
+            numbers.append(number)
+    return ",".join(numbers)
+
+
+def next_command(target: str, windows: bool, port_lines: list[str], did_follow_up: bool) -> str:
+    """One follow-up command. It is printed, not run."""
+    if not did_follow_up:
+        if windows:
+            flags = " ".join(WINDOWS_FLAGS)
+        else:
+            flags = " ".join(OTHER_FLAGS)
+        return f"nmap {flags} {target}"
+
+    if not port_lines:
+        return f"nmap -Pn -sS -sV -T4 --top-ports 1000 {target}"
+
+    ports = port_numbers(port_lines)
+    if windows:
+        return f"nmap -Pn -sS -sV -sC -T4 --source-port 53 -p {ports} {target}"
+    return f"nmap -Pn -sS -sV -sC -T4 -p {ports} {target}"
+
+
+def print_summary(port_lines: list[str], follow_up: str) -> None:
+    print()
+    print("Summary")
+    print("-------")
+    if not port_lines:
+        print("Open ports: none")
+    else:
+        print("Open ports:")
+        for line in port_lines:
+            print(f"  {line}")
+    print(f"Next: {follow_up}")
+
+
+def scan(target: str, quick: bool, windows: bool) -> tuple[str, bool]:
+    """Run the chosen scans. Returns the combined output and the Windows flag."""
+    if quick:
+        output = run_nmap(target, FAST_FLAGS)
+        return output, host_is_windows(output)
+
+    if windows:
+        output = run_nmap(target, WINDOWS_FLAGS)
+        return output, True
+
+    first = run_nmap(target, FAST_FLAGS)
+    is_windows = host_is_windows(first)
+    print()
+    if is_windows:
+        print("Windows markers found. Running the Windows port scan.")
+        second_flags = WINDOWS_FLAGS
+    else:
+        print("No Windows markers found. Running a top-100 version scan.")
+        second_flags = OTHER_FLAGS
+    print()
+    second = run_nmap(target, second_flags)
+    return first + "\n" + second, is_windows
+
+
+def ask_ai(output: str, model: str | None) -> None:
+    """Send the real Nmap text to Ollama. Failures are reported inside ai_analysis."""
+    from ai_analysis import DEFAULT_MODEL, analyze_scan, print_analysis
+
+    analysis = analyze_scan(output, model=model or DEFAULT_MODEL)
+    if analysis:
+        print_analysis(analysis)
 
 
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Build nmap commands for one IP address or hostname.",
-        epilog="Example: python3 nmap_scans.py 192.168.1.10 --ai",
+        description="Scan one IP address or hostname with nmap.",
     )
     parser.add_argument("target", help="IP address or hostname to scan")
     parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Only run the fast scan (nmap -Pn -sS -T4 -F) and stop.",
+    )
+    parser.add_argument(
         "--windows",
         action="store_true",
-        help=(
-            "Host is Windows (ports 135 or 3389, or msrpc, ms-wbt-server, "
-            "Microsoft IIS). Print the two Windows commands instead of the usual four."
-        ),
+        help="Skip detection and run only the Windows command.",
     )
     parser.add_argument(
         "--ai",
         action="store_true",
-        help="After the scan output, ask a local Ollama model for a short analysis.",
+        help="After the scan, send the Nmap output to a local Ollama model.",
     )
     parser.add_argument(
         "--model",
@@ -147,21 +200,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Normal output. This block does not know about the model.
-    lines = []
-    for scan in scans_for_target(args.target, windows=args.windows):
-        line = f"{scan.name}: {' '.join(scan.command())}"
-        print(line)
-        lines.append(line)
+    if args.quick and args.windows:
+        print("Error: pass either --quick or --windows, not both.", file=sys.stderr)
+        sys.exit(1)
 
-    # Optional step. Import the AI module only when the user asked for it.
+    require_nmap()
+    output, is_windows = scan(args.target, quick=args.quick, windows=args.windows)
+    ports = open_port_lines(output)
+    print_summary(
+        ports,
+        next_command(args.target, is_windows, ports, did_follow_up=not args.quick),
+    )
     if args.ai:
-        from ai_analysis import DEFAULT_MODEL, analyze_scan, print_analysis
-
-        summary = "Planned nmap commands:\n" + "\n".join(lines)
-        analysis = analyze_scan(summary, model=args.model or DEFAULT_MODEL)
-        if analysis:
-            print_analysis(analysis)
+        ask_ai(output, args.model)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 This module is not imported unless the user passes --ai.
 Scanning code should stay in the main tool; call analyze_scan()
-with a plain-text summary after the scan (or command list) is done.
+with the real Nmap output after the scan is done.
 
 To point this at another local model later, edit the settings below
 or pass model= / endpoint= into analyze_scan().

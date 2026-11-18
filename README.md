@@ -1,37 +1,47 @@
 # smartnmap
 
-Prints Nmap commands for one target. It does not run Nmap.
+Scans one target with Nmap and prints a short summary.
 
-`--windows` uses the scan types that worked on the Windows lab hosts I tested. `--ai` sends the command list to a local Ollama model.
+The first scan is always:
+
+```text
+nmap -Pn -sS -T4 -F TARGET
+```
+
+If that output contains `135/tcp`, `3389/tcp`, `msrpc`, `ms-wbt-server`, or `Microsoft IIS`, the host is treated as Windows and the next command is:
+
+```text
+nmap -Pn -sS -sV -T4 --source-port 53 -p 21,53,80,135,3389 TARGET
+```
+
+Any other host gets:
+
+```text
+nmap -Pn -sS -sV -T4 --top-ports 100 TARGET
+```
+
+Nmap's output is printed as it arrives. At the end you get the open ports and one recommended next command. That next command is not run.
+
+SYN scans (`-sS`) need root on Linux. The tool never uses `-sN`, `-sF`, `-sX`, `-sA`, or `-f`.
 
 ## Usage
 
 ```bash
 python3 nmap_scans.py 10.65.166.153
+python3 nmap_scans.py 10.65.166.153 --quick
 python3 nmap_scans.py 10.65.166.153 --windows
-python3 nmap_scans.py 10.65.166.153 --windows --ai --model qwen2.5:1.5b
+python3 nmap_scans.py 10.65.166.153 --ai --model qwen2.5:1.5b
 ```
 
-Pass `--windows` when the host already looks like Windows: port 135 or 3389, or services `msrpc`, `ms-wbt-server`, or Microsoft IIS.
+`--quick` runs only the fast scan and stops.
 
-On those hosts, NULL, FIN, Xmas, ACK, and packet fragmentation were useless or hid open ports. A SYN scan with `--source-port 53` worked, so that is what `--windows` prints:
+`--windows` skips detection and runs only the Windows command. Do not combine it with `--quick`.
 
-```text
-nmap -Pn -sS -sV -T4 --source-port 53 -p 21,53,80,135,3389 TARGET
-nmap -Pn -sS -sV -T4 -F TARGET
-```
+If `nmap` is missing, or a scan exits non-zero, the tool prints an error and exits.
 
 ## AI
 
 `--ai` needs Ollama running on your machine: https://ollama.com
 The default model name is `llama3.1`. Pass `--model` to use another one, for example `qwen2.5:1.5b`.
 
-If Ollama is down, the command list still prints.
-
-The model only sees the planned commands, not live Nmap output.
-
-## Not done yet
-
-- Running the scans
-- Detecting Windows without `--windows`
-- Sending real Nmap results to the model
+The model sees the real Nmap output. If Ollama is down, the scan results still print.
